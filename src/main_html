@@ -1,0 +1,476 @@
+#include <Streaming.h>         
+#include <Ethernet.h>          
+#include <SPI.h>
+#include <MemoryFree.h>
+#include <Flash.h>
+#include <EEPROM.h>
+#include <TaskScheduler.h>
+
+#define GET_HTTP_VALUE_LENGHT 50
+#define GET_HTTP_REQUEST_LENGHT 100
+#define HART_RAW_REQUEST_LENGHT 100
+
+#define IPV4_LENGTH 4
+
+#define ENABLE_FACTORY_IP_RESET
+#define FACTORY_DEFAULT_IP      {192,168,0,102}
+#define FACTORY_DEFAULT_SUBNET  {255,255,255,0}
+#define FACTORY_DEFAULT_GATEWAY {0,0,0,0}
+
+void serverListeningLoopCallback();
+void httpServerCallback();
+void hartServerCallback();
+void loggerTaskCallback();
+void ethernetInit();
+
+Task httpServerTask(5, TASK_FOREVER, &httpServerCallback);
+Task hartServerTask(5, TASK_FOREVER, &hartServerCallback);
+Task loggerTask(5000, TASK_FOREVER, &loggerTaskCallback);
+Task clientsConnectServerTask(500, TASK_FOREVER, &serverListeningLoopCallback);
+
+Scheduler runner;
+EthernetServer server(80);
+EthernetServer hartServer(102);
+EthernetClient hartClient;
+EthernetClient httpClient;
+String httpRequest = String(GET_HTTP_REQUEST_LENGHT + 1);
+String hartRequest = String(HART_RAW_REQUEST_LENGHT + 1);
+
+bool resetEthernet = false;
+byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED };
+byte ip[IPV4_LENGTH] = FACTORY_DEFAULT_IP;
+byte subnet[IPV4_LENGTH] = FACTORY_DEFAULT_SUBNET;
+byte gateway[IPV4_LENGTH] = FACTORY_DEFAULT_GATEWAY;
+unsigned long i = 0;
+
+void loggerTaskCallback()
+{
+    httpClient << F("data: Simulated Event ") << i++ << endl << endl;
+  /*if (httpClient) 
+  {
+    if (httpClient.connected()) 
+    {
+      Serial << "test" << endl;
+    }
+  }*/
+}
+
+void serverListeningLoopCallback()
+{
+  //Serial << "Check for clients connections..." << endl;
+  /*Gestion du client http*/
+  if(httpServerTask.isEnabled() == false)
+  {
+    httpClient = server.available();
+  }
+  if(httpClient && httpServerTask.isEnabled() == false)
+  {
+    Serial << "New single http client from ";
+    /*httpClient.remoteIP().printTo(Serial);
+    Serial << endl; */
+    httpServerTask.enable();  
+    loggerTask.enable();
+  }
+  
+  /*Gestion du client hart*/
+  if(hartServerTask.isEnabled() == false)
+  {
+    hartClient = hartServer.available();
+  }
+  if(hartClient && hartServerTask.isEnabled() == false)
+  {
+    hartServerTask.enable();
+    Serial << "New single hart client from ";
+    hartClient.remoteIP().printTo(Serial);
+    Serial << endl;   
+  }
+  //Serial << "hartServerTask status :" << hartServerTask.isEnabled() << endl;
+  //Serial << "httpServerTask status : "<< httpServerTask.isEnabled() << endl;
+
+}
+
+char * getValueFromHttpRequest(const char * request, const char * valueIdentifier, const unsigned int maxValueLength)
+{
+  //http://192.168.0.2/?i1=172&i2=31&i3=1&i4=50&s1=255&s2=255&s3=255&s4=0&gw1=255&gw2=255&gw3=255&gw4=0
+  char * value = nullptr;
+  char * startValueIdentifier = nullptr;
+  unsigned int valueLength = 0;
+  unsigned int valuePosition = -1;
+
+  Serial << request << endl;
+
+  //Calcule la taille de l'identifiant complet avec le '=' et '\0', d'ou le + 2;
+  size_t length = strlen(valueIdentifier) + 2;
+  char * fullIdentifier = (char *)malloc(length * sizeof(char));
+  memset(fullIdentifier, 0, length);
+
+  //Copie l'identifiant sans le '0' puis ajoute le '=' avant '\0'
+  strcpy(fullIdentifier, valueIdentifier);
+  fullIdentifier[length - 2] = '=';
+  Serial << "valueIdentifier : " << fullIdentifier << endl;
+
+  //Recherche de l'identifiant complet dans la requete
+  startValueIdentifier = strstr(request, fullIdentifier);
+  if(startValueIdentifier != NULL)
+  {
+    //Position de départ de la valeur dans la requête
+    valuePosition = startValueIdentifier - request + strlen(fullIdentifier);
+    Serial << "valuePosition : " << valuePosition << endl;
+    
+    //Calcule la taille de la valeur en recherchant soit '&' soit '\0' soit ' '
+    for(valueLength = 0; valueLength < maxValueLength; valueLength++)
+    {
+      char c = request[valuePosition + valueLength];
+      if(c == '\0' || c == '&' || c == ' ') break;
+    }
+    valueLength+=1; //Pour la fin de chaine;
+    Serial << "valueLength : " << valueLength << endl;
+    value = (char *)malloc((valueLength) * sizeof(char));
+
+    //Copie de la valeur de la requête
+    for(int i = 0; i < valueLength; i++)
+    {
+      value[i] = request[valuePosition + i];
+    }
+    value[valueLength - 1] = '\0';
+    Serial << endl << value << endl;
+  }
+
+  free(fullIdentifier);
+  return value;
+}
+
+bool setAddressFromHttpRequest(const char * request, const char addressByteIdentifier, byte address[], const unsigned int addressLength, const byte maxAddressByteValue = 255)
+{
+  char item[3] = { addressByteIdentifier, 0, 0,};
+  bool validValues = true;
+  for(byte i = 1; i < addressLength + 1;  i++)
+  {
+    itoa(i, &item[1], 10);
+    char * str_value = getValueFromHttpRequest(request, item, GET_HTTP_VALUE_LENGHT);
+    Serial << str_value <<endl;
+    char * endPtr = nullptr;
+    unsigned long value = strtoul(str_value, &endPtr, 10);
+    if(endPtr != str_value)
+    {
+      Serial << "Conversion ok." <<endl;
+      if(value > maxAddressByteValue || value < 0)
+      {
+        validValues = false;
+        Serial << "Valeur en dehors des bornes." <<endl;
+      }
+      else address[i] = (byte)value;
+    } 
+    else
+    {
+      validValues = false;     
+      Serial << "Conversion nok." <<endl;
+      break;
+    } 
+  }
+  return validValues;
+}
+
+void printMainHtmlPageToClient(EthernetClient * ethernetClient)
+{
+  *ethernetClient << F("HTTP/1.1 200 OK") << endl /*<< F("Cache-Control: no-cache") << endl << F("Connection: keep-alive") << endl*/ << F("Content-Type: text/html") << endl << endl;
+  *ethernetClient << F("<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">");
+  *ethernetClient << F("<link rel=\"icon\" href=\"https://cdn.icon-icons.com/icons2/2699/PNG/512/siemens_logo_icon_170741.png\" type=\"image/x-icon\">");
+  *ethernetClient << F("<script src=\"https://cdnjs.cloudflare.com/ajax/libs/moment.js/2.29.1/moment.min.js\"></script>");
+  *ethernetClient << F("<title>Hart modem</title>");
+  *ethernetClient << F("<style>");
+  *ethernetClient << F("body { font-family: Arial, sans-serif; margin: 0; padding: 0; overflow-y: hidden; }");
+  *ethernetClient << F(".topbar { background-color: #f1f1f1; color: #009999; text-align: center; width: 100%; display: flex; justify-content: space-between; align-items: center; box-shadow: 0 0 10px #000; }");
+  *ethernetClient << F(".topbar img { max-width: 100%; height: 50px; margin: 10px; }");
+  *ethernetClient << F(".topbar h1 { top: 10px; margin: 10px; }");
+  *ethernetClient << F(".container { display: flex; flex: 1; overflow: hidden; }");
+  *ethernetClient << F(".menu { width: 200px; background-color: #f1f1f1; overflow-y: hidden; height: 100vh; box-shadow: 0 0 10px #000; }");
+  *ethernetClient << F(".menu ul { list-style-type: none; padding: 0; margin: 0; }");
+  *ethernetClient << F(".menu ul li { padding: 10px 20px; border-bottom: 1px solid #ddd; }");
+  *ethernetClient << F(".menu ul li:hover { background-color: #ddd; cursor: pointer; }");
+  *ethernetClient << F(".menu ul li a { text-decoration: none; color: #333; }");
+  *ethernetClient << F(".content { flex: 1; margin: 20px; overflow: scroll; width: 100%; height: 100vh; }");
+  *ethernetClient << F(".hidden { display: none; }");
+  *ethernetClient << F("h2[class=\"Titre\"] { text-align: center; color: #009999; }");
+  *ethernetClient << F(".network-info { font-weight: bold; margin-bottom: 10px; }");
+  *ethernetClient << F(".tableSelection { width: 100%; }");
+  *ethernetClient << F(".tableSelection tr { margin-bottom: 10px; }");
+  *ethernetClient << F(".tableSelection td { padding: 5px; }");
+  *ethernetClient << F(".network-info { font-weight: normal; margin-bottom: 10px; font-family: 'Arial', sans-serif; font-size: 16px; }");
+  *ethernetClient << F(".network-info p { margin: 5px 0; }");
+  *ethernetClient << F(".network-setting { font-weight: normal; margin-bottom: 10px; font-family: 'Arial', sans-serif; font-size: 16px; }");
+  *ethernetClient << F(".network-setting table { margin: 5px 0; }");
+  *ethernetClient << F("input[type=\"text\"] { width: 50px; padding: 5px; margin: 0; }");
+  *ethernetClient << F("input[type=\"submit\"] { background-color: #009999; color: #fff; padding: 10px; border: none; border-radius: 5px; cursor: pointer; }");
+  *ethernetClient << F(".loggerTable { width: 100%; border-collapse: collapse; font-family: Arial, sans-serif; margin-top: 10px; }");
+  *ethernetClient << F(".loggerTable th, .loggerTable td { border: 1px solid #ddd; padding: 8px; text-align: left; }");
+  *ethernetClient << F(".loggerTable th.timestamp { width: 200px; white-space: nowrap; }");
+  *ethernetClient << F(".loggerTable th { background-color: #f2f2f2; }");
+  *ethernetClient << F("button { margin-top: 10px; padding: 8px; background-color: #f44336; color: white; border: none; border-radius: 4px; cursor: pointer; }");
+  *ethernetClient << F("</style></head><body>");
+  *ethernetClient << F("<div class=\"topbar\">");
+  *ethernetClient << F("<img src=\"https://brandville.siemens.com/profiles/c2_base/modules/c2cms_instance_logo/assets/sag-logo.png\" alt=\"Siemens Logo\">");
+  *ethernetClient << F("<h1>Carte de communication Hart</h1>");
+  *ethernetClient << F("</div>");
+  *ethernetClient << F("<div class=\"container\">");
+  *ethernetClient << F("<div class=\"menu\">");
+  *ethernetClient << F("<ul>");
+  *ethernetClient << F("<li onclick=\"showSection('section1')\"><a>Network Settings</a></li>");
+  *ethernetClient << F("<li onclick=\"showSection('section2')\"><a>Logger</a></li>");
+  *ethernetClient << F("</ul>");
+  *ethernetClient << F("</div>");
+  *ethernetClient << F("<div id=\"section1\" class=\"section\">");
+  *ethernetClient << F("<div class=\"content\">");
+  *ethernetClient << F("<h2 class=\"Titre\">Network Settings</h2>");
+  *ethernetClient << F("<div class=\"network-info\">");
+  *ethernetClient << F("<p><strong>Current Network Settings:</strong></p>");
+  *ethernetClient << F("<p>IP Address: <strong>") << ip[0] << F("</strong></p>");
+  *ethernetClient << F("<p>Subnet Mask: <strong>") << subnet[0] << F("</strong></p>");
+  *ethernetClient << F("<p>Gateway: <strong>") << gateway[0] << F("</strong></p>");
+  *ethernetClient << F("</div>");
+  *ethernetClient << F("<div class=\"network-setting\">");
+  *ethernetClient << F("<p>Change IP Address:</p>");
+  *ethernetClient << F("<form name=\"changeipaddress\" action=\"\" method=\"get\" class=\"form-table\"><table>");
+  *ethernetClient << F("<tr><td>IP Address:</td>");
+  *ethernetClient << F("<td><input type=\"text\" maxlength=\"3\" name=\"i1\" value=\"") << ip[0] << F("\" onkeydown=\"return event.key != 'Enter';\" pattern=\"(?:25[0-4]|2[0-4][0-9]|[01]?[0-9][0-9]?)\"></td>");
+  *ethernetClient << F("<td><input type=\"text\" maxlength=\"3\" name=\"i2\" value=\"") << ip[1] << F("\" onkeydown=\"return event.key != 'Enter';\" pattern=\"(?:25[0-4]|2[0-4][0-9]|[01]?[0-9][0-9]?)\"></td>");
+  *ethernetClient << F("<td><input type=\"text\" maxlength=\"3\" name=\"i3\" value=\"") << ip[2] << F("\" onkeydown=\"return event.key != 'Enter';\" pattern=\"(?:25[0-4]|2[0-4][0-9]|[01]?[0-9][0-9]?)\"></td>");
+  *ethernetClient << F("<td><input type=\"text\" maxlength=\"3\" name=\"i4\" value=\"") << ip[3] << F("\" onkeydown=\"return event.key != 'Enter';\" pattern=\"(?:25[0-4]|2[0-4][0-9]|[01]?[0-9][0-9]?)\"></td></tr>");
+  *ethernetClient << F("<tr><td>Subnet Mask:</td>");
+  *ethernetClient << F("<td><input type=\"text\" maxlength=\"3\" name=\"s1\" value=\"") << subnet[0] << F("\" onkeydown=\"return event.key != 'Enter';\" pattern=\"(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\"></td>");
+  *ethernetClient << F("<td><input type=\"text\" maxlength=\"3\" name=\"s2\" value=\"") << subnet[1] << F("\" onkeydown=\"return event.key != 'Enter';\" pattern=\"(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\"></td>");
+  *ethernetClient << F("<td><input type=\"text\" maxlength=\"3\" name=\"s3\" value=\"") << subnet[2] << F("\" onkeydown=\"return event.key != 'Enter';\" pattern=\"(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\"></td>");
+  *ethernetClient << F("<td><input type=\"text\" maxlength=\"3\" name=\"s4\" value=\"") << subnet[3] << F("\" onkeydown=\"return event.key != 'Enter';\" pattern=\"(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\"></td></tr>");
+  *ethernetClient << F("<tr><td>Gateway:</td>");
+  *ethernetClient << F("<td><input type=\"text\" maxlength=\"3\" name=\"g1\" value=\"") << gateway[0] << F("\" onkeydown=\"return event.key != 'Enter';\" pattern=\"(?:25[0-4]|2[0-4][0-9]|[01]?[0-9][0-9]?)\"></td>");
+  *ethernetClient << F("<td><input type=\"text\" maxlength=\"3\" name=\"g2\" value=\"") << gateway[1] << F("\" onkeydown=\"return event.key != 'Enter';\" pattern=\"(?:25[0-4]|2[0-4][0-9]|[01]?[0-9][0-9]?)\"></td>");
+  *ethernetClient << F("<td><input type=\"text\" maxlength=\"3\" name=\"g3\" value=\"") << gateway[2] << F("\" onkeydown=\"return event.key != 'Enter';\" pattern=\"(?:25[0-4]|2[0-4][0-9]|[01]?[0-9][0-9]?)\"></td>");
+  *ethernetClient << F("<td><input type=\"text\" maxlength=\"3\" name=\"g4\" value=\"") << gateway[3] << F("\" onkeydown=\"return event.key != 'Enter';\" pattern=\"(?:25[0-4]|2[0-4][0-9]|[01]?[0-9][0-9]?)\"></td></tr>");
+  *ethernetClient << F("<tr><td align=\"center\" colspan=\"5\"><input type=\"submit\" value=\"Update Network Configuration\"></td></tr></table></form></div></div></div>");
+  *ethernetClient << F("<div id=\"section2\" class=\"section hidden\">");
+  *ethernetClient << F("<div class=\"content\">");
+  *ethernetClient << F("<h2 class=\"Titre\">Network Settings</h2>");
+  *ethernetClient << F("<button onclick=\"clearLogger()\">Effacer la liste</button>");
+  *ethernetClient << F("<table class=\"loggerTable\" id=\"logger\"><thead><tr><th class=\"timestamp\">Timestamp</th><th>Message</th></tr></thead><tbody></tbody></table>");
+  *ethernetClient << F("</div></div>");
+  *ethernetClient << F("</div>");
+  *ethernetClient << F("<script>");
+  *ethernetClient << F("function showSection(sectionId) {var sections = document.querySelectorAll('.section');sections.forEach(function(section) {section.classList.add('hidden');});");
+  *ethernetClient << F("var selectedSection = document.getElementById(sectionId);if (selectedSection) {selectedSection.classList.remove('hidden');}}document.addEventListener('DOMContentLoaded', function (event) {if ");
+  *ethernetClient << F("(window.location.href.indexOf(\"=\") > 1) {window.location.href = '") << ip[0] << "." << ip[1] << "." << ip[2] << "." << ip[3] << F("';}");
+  *ethernetClient << F("});");
+  *ethernetClient << F("var sortingInProgress = false;");
+  *ethernetClient << F("function addToLogger(timestamp, message) {var loggerTable = document.getElementById('logger').getElementsByTagName('tbody')[0];");
+  *ethernetClient << F("var row = loggerTable.insertRow();var cell1 = row.insertCell(0);var cell2 = row.insertCell(1);");
+  *ethernetClient << F("cell1.textContent = timestamp;cell2.textContent = message;");
+  *ethernetClient << F("if (!sortingInProgress) {sortingInProgress = true;sortLoggerByDate();sortingInProgress = false;}");
+  *ethernetClient << F("}");//storedMessages.push({ timestamp: timestamp, message: message });localStorage.setItem('loggerMessages', JSON.stringify(storedMessages));
+  *ethernetClient << F("function clearLogger() {localStorage.removeItem('loggerMessages');document.getElementById('logger').getElementsByTagName('tbody')[0].innerHTML = '';}");
+  *ethernetClient << F("function formatDate(date) {return moment(date).format('HH:mm:ss.SSS');}");
+  *ethernetClient << F("function sortLoggerByDate() {var loggerTable = document.getElementById('logger');");
+  *ethernetClient << F("var tbody = loggerTable.getElementsByTagName('tbody')[0];var rows = Array.from(tbody.rows);");
+  *ethernetClient << F("var logEntries = rows.map(row => {return {timestamp: row.cells[0].textContent,message: row.cells[1].textContent};});");
+  *ethernetClient << F("logEntries.sort(function (a, b) {return moment(b.timestamp, 'HH:mm:ss.SSS') - moment(a.timestamp, 'HH:mm:ss.SSS');});");
+  *ethernetClient << F("tbody.innerHTML = '';logEntries.forEach(function (entry) {addToLogger(entry.timestamp, entry.message);});}");
+  *ethernetClient << F("function initSSE() {var eventSource = new EventSource('/events');");
+  *ethernetClient << F("eventSource.onmessage = function (event) {console.log('Received SSE event:', event.data);addToLogger(formatDate(new Date()), event.data);};");
+  *ethernetClient << F("eventSource.onerror = function (error) {console.error('EventSource failed:', error);eventSource.close();};}");
+  *ethernetClient << F("var activeSection = localStorage.getItem('activeSection');");
+  *ethernetClient << F("if (activeSection) {showSection(activeSection);}");
+  //*ethernetClient << F("var storedMessages = JSON.parse(localStorage.getItem('loggerMessages')) || [];");
+  //*ethernetClient << F("storedMessages.forEach(function(entry) {addToLogger(entry.timestamp, entry.message);});");
+  *ethernetClient << F("initSSE();");
+  *ethernetClient << F("</script>");
+  *ethernetClient << F("</body></html>");
+}
+
+void httpServerCallback()
+{
+  /*GESTION SERVEUR WEB*/
+  if (httpClient) 
+  {
+    //Serial << "New http client connected.";
+    if (httpClient.connected()) 
+    {
+      Serial << endl << F("===START OF GET HTTP REQUEST===") << endl;
+      unsigned int requestSize = 0;
+      while (httpClient.available())
+      {     
+        requestSize++;
+        char data = httpClient.read();                                    
+        if (httpRequest.length() < GET_HTTP_REQUEST_LENGHT) 
+        {   
+          httpRequest.concat(data);        
+        }
+        Serial << data;    
+      }
+      httpRequest.concat('\0');
+      Serial << F("===END OF GET HTTP REQUEST (") << requestSize << F(" bytes)===") << endl << endl;
+      if(httpRequest.indexOf("GET / HTTP") > -1)
+      {
+        Serial << F("Supported GET HTTP request : main page.") << endl;
+        printMainHtmlPageToClient(&httpClient);      
+      }
+      else if(httpRequest.indexOf("GET /?i1") > -1)
+      {
+        Serial << F("Supported GET HTTP request : send data from main page.") << endl;
+        byte tmp_ip[IPV4_LENGTH] = FACTORY_DEFAULT_IP;
+        byte tmp_subnet[IPV4_LENGTH] = FACTORY_DEFAULT_SUBNET;
+        byte tmp_gateway[IPV4_LENGTH] = FACTORY_DEFAULT_GATEWAY;
+        bool ipValid, subnetValid, gatewayValid = false;
+        ipValid = setAddressFromHttpRequest(httpRequest.c_str(), 'i', tmp_ip, IPV4_LENGTH, 254); 
+        if(ipValid) Serial << "IP is valid." << endl;    
+        subnetValid = setAddressFromHttpRequest(httpRequest.c_str(), 's', tmp_subnet, IPV4_LENGTH); 
+        if(subnetValid) Serial << "Subnet is valid." << endl;   
+        gatewayValid = setAddressFromHttpRequest(httpRequest.c_str(), 'g', tmp_gateway, IPV4_LENGTH); 
+        if(gatewayValid) Serial << "Gateway is valid." << endl;  
+
+        if(ipValid && subnetValid && gatewayValid)
+        {
+          for(int i = 0; i < IPV4_LENGTH; i++)
+          {
+            ip[i] = tmp_ip[i];
+            subnet[i] = tmp_subnet[i];
+            gateway[i] = tmp_gateway[i];
+          }
+        }
+
+        /*TO DO enregristrer dans eeprom*/
+        printMainHtmlPageToClient(&httpClient);      
+      }
+      else if(httpRequest.indexOf("GET /events") > -1)
+      {
+        Serial << F("Supported GET HTTP request : events.") << endl;
+        httpClient << F("HTTP/1.1 200 OK") << endl << F("Content-Type: text/event-stream")<< /*endl << F("Connection: keep-alive") << endl << F("Cache-Control: public") <<*/ endl << endl;
+      }
+      else
+      {
+        Serial << F("Unsupported GET HTTP request.") << endl;
+        httpClient << F("HTTP/1.1 404") << endl;
+      }
+      httpRequest = "";
+      Serial.flush();
+      httpClient.flush();
+      httpClient.stop();
+      httpServerTask.disable();
+    }
+  } //End html client section
+}
+
+void hartServerCallback()
+{
+  /*GESTION SERVEUR HART*/
+  
+  if (hartClient) 
+  {
+    if (hartClient.connected()) 
+    {     
+      if (hartClient.available()) 
+      {
+        char clientRequest = hartClient.read();                                          
+        if (hartRequest.length() < HART_RAW_REQUEST_LENGHT) 
+        {   
+            hartRequest.concat(clientRequest);        
+        }
+        Serial << clientRequest;
+        if(clientRequest == 'q')
+        {
+            Serial << "Hart client request server closes the connection" << endl;
+            hartClient.flush();
+            hartClient.stop();
+            hartServerTask.disable();
+        }
+      }
+    }
+    else
+    {
+      Serial << "Hart client closes the connection" << endl;
+      hartClient.flush();
+      hartClient.stop();
+      hartServerTask.disable();
+    }     
+  }
+  else
+  {
+    Serial << "Hart client closes the connection" << endl;
+    hartClient.flush();
+    hartClient.stop();
+    hartServerTask.disable();
+  }
+}
+
+void ethernetInit()
+{
+  
+  #ifdef ENABLE_FACTORY_IP_RESET
+  Serial << "Writing factory ip setting...\n";
+  EEPROM.write( 1, ip[0] );        
+  EEPROM.write( 2, ip[1] );       
+  EEPROM.write( 3, ip[2] );         
+  EEPROM.write( 4, ip[3] ); 
+
+  EEPROM.write( 5, subnet[0] );         
+  EEPROM.write( 6, subnet[1] );         
+  EEPROM.write( 7, subnet[2] );         
+  EEPROM.write( 8, subnet[3] ); 
+
+  EEPROM.write( 9, gateway[0] );         
+  EEPROM.write( 10, gateway[1] );         
+  EEPROM.write( 11, gateway[2] );         
+  EEPROM.write( 12, gateway[3] ); 
+  Serial << "Writing done.\n";
+  #endif
+
+  //Lecture des adresses en eeprom
+  ip[0] = EEPROM.read( 1 );
+  ip[1]  = EEPROM.read( 2 );
+  ip[2] = EEPROM.read( 3 );
+  ip[3] = EEPROM.read( 4 );
+
+  subnet[0] = EEPROM.read( 5 );
+  subnet[1] = EEPROM.read( 6 );
+  subnet[2] = EEPROM.read( 7 );
+  subnet[3] = EEPROM.read( 8 );
+
+  gateway[0] = EEPROM.read( 9);
+  gateway[1]  = EEPROM.read( 10 );
+  gateway[2]  = EEPROM.read( 11 );
+  gateway[3]  = EEPROM.read( 12 );
+  
+
+ //////////////////////////////////////////////////////////////////
+
+  Serial << "Starting ethernet..." << endl;
+  Ethernet.begin(mac, ip, gateway, subnet);
+  Serial << "Ethernet started." << endl;
+
+  Serial << "MAC: " << String(mac[0], HEX) << "." << String(mac[1], HEX) <<"." << String(mac[2], HEX) << "." << String(mac[3], HEX) << "." << String(mac[4], HEX) << "." << String(mac[5], HEX) << endl;
+  Serial << "IP: " << ip[0] << "." << ip[1] <<"." << ip[2] << "." << ip[3] << endl;
+  Serial << "Subnet: " << subnet[0] << "." << subnet[1] <<"." << subnet[2] << "." << subnet[3] << endl;
+  Serial << "Gateway: " << gateway[0] << "." << gateway[0] <<"." << gateway[0] << "." << gateway[0] << endl;  
+  server.begin();       
+  hartServer.begin();
+}
+
+void setup()
+{
+  Serial.begin(9600);
+  while (!Serial);
+  Serial << endl << "Setup()";
+
+  runner.init();
+  runner.addTask(clientsConnectServerTask);
+  runner.addTask(hartServerTask);
+  runner.addTask(httpServerTask);
+  runner.addTask(loggerTask);
+  delay(3000);
+  clientsConnectServerTask.enable();
+  ethernetInit();
+}
+
+void loop()
+{
+  runner.execute();
+  //Serial << F("Available SRAM: ") << freeMemory() << endl;
+  //delay(1000);
+}
